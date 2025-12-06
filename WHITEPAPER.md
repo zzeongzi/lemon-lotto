@@ -70,25 +70,17 @@ LNbits API를 통한 인보이스 생성/결제
 3. 시스템 구조
 
 3.1 아키텍처
+graph TD
+    A[Discord Bot<br/>유저 인터페이스] --> B[Database<br/>SQLite]
+    A --> C[LNbits<br/>Lightning Network]
+    B --> D[Bitcoin Mempool<br/>블록 데이터]
+    C --> D
+    
+    style A fill:#5865F2,stroke:#fff,color:#fff
+    style B fill:#2ecc71,stroke:#fff,color:#fff
+    style C fill:#f39c12,stroke:#fff,color:#fff
+    style D fill:#e74c3c,stroke:#fff,color:#fff
 
-┌─────────────────────────────────────────────────┐
-│                  Discord Bot                    │
-│                (유저 인터페이스)                 │
-└─────────────────┬───────────────────────────────┘
-                  │
-         ┌────────┴────────┐
-         │                 │
-    ┌────▼─────┐    ┌─────▼──────┐
-    │ Database │    │   LNbits   │
-    │ (SQLite) │    │ (Lightning)│
-    └────┬─────┘    └─────┬──────┘
-         │                │
-         └────────┬───────┘
-                  │
-         ┌────────▼─────────┐
-         │ Bitcoin Mempool  │
-         │  (블록 데이터)    │
-         └──────────────────┘
 
 3.2 데이터베이스 스키마
 
