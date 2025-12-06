@@ -1,0 +1,139 @@
+import aiohttp
+import os
+
+LNBITS_URL = os.getenv("LNBITS_URL")
+ADMIN_KEY = os.getenv("LNBITS_ADMIN_KEY")
+
+# [신규] 타임아웃 설정
+TIMEOUT = aiohttp.ClientTimeout(total=10)
+
+async def get_wallet_balance():
+    """지갑 잔액 조회 (msat -> sat 변환)"""
+    url = f"{LNBITS_URL}/api/v1/wallet"
+    headers = {"X-Api-Key": ADMIN_KEY}
+    print(f"[DEBUG] Fetching wallet balance from: {url}")
+    
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    balance_sats = data.get("balance", 0) / 1000
+                    print(f"[DEBUG] Wallet balance: {balance_sats} Sats")
+                    return int(balance_sats)
+                else:
+                    print(f"[ERROR] LNbits HTTP {resp.status}")
+    except Exception as e:
+        print(f"[ERROR] Get wallet balance failed: {e}")
+    
+    return 0
+
+async def create_invoice(amount, memo=""):
+    """인보이스 생성"""
+    url = f"{LNBITS_URL}/api/v1/payments"
+    headers = {"X-Api-Key": ADMIN_KEY, "Content-Type": "application/json"}
+    payload = {"out": False, "amount": amount, "memo": memo}
+    
+    print(f"[DEBUG] Creating invoice: {amount} Sats")
+    
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status == 201:
+                    data = await resp.json()
+                    print(f"[DEBUG] Invoice created: {data['payment_hash'][:16]}...")
+                    return data
+                else:
+                    print(f"[ERROR] LNbits HTTP {resp.status}")
+    except Exception as e:
+        print(f"[ERROR] Create invoice failed: {e}")
+    
+    return None
+
+async def check_payment(payment_hash):
+    """결제 확인"""
+    url = f"{LNBITS_URL}/api/v1/payments/{payment_hash}"
+    headers = {"X-Api-Key": ADMIN_KEY}
+    
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    is_paid = data.get("paid", False)
+                    if is_paid:
+                        print(f"[DEBUG] Payment confirmed: {payment_hash[:16]}...")
+                    return is_paid
+    except Exception as e:
+        print(f"[ERROR] Check payment failed: {e}")
+    
+    return False
+
+async def pay_invoice(payment_request):
+    """인보이스 결제"""
+    url = f"{LNBITS_URL}/api/v1/payments"
+    headers = {"X-Api-Key": ADMIN_KEY, "Content-Type": "application/json"}
+    payload = {"out": True, "bolt11": payment_request}
+    
+    print(f"[DEBUG] Paying invoice: {payment_request[:30]}...")
+    
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status == 201:
+                    print(f"[DEBUG] Payment sent successfully")
+                    return True
+                else:
+                    print(f"[ERROR] Pay invoice HTTP {resp.status}")
+    except Exception as e:
+        print(f"[ERROR] Pay invoice failed: {e}")
+    
+    return False
+
+async def decode_invoice(payment_request):
+    """인보이스 디코딩"""
+    url = f"{LNBITS_URL}/api/v1/payments/decode"
+    headers = {"X-Api-Key": ADMIN_KEY}
+    params = {"data": payment_request}
+    
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+            async with session.post(url, headers=headers, json=params) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+    except Exception as e:
+        print(f"[ERROR] Decode invoice failed: {e}")
+    
+    return None
+
+async def pay_address(address, amount):
+    """라이트닝 주소로 송금"""
+    try:
+        # 1. 주소를 인보이스로 변환
+        username, domain = address.split("@")
+        lnurl_url = f"https://{domain}/.well-known/lnurlp/{username}"
+        
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+            async with session.get(lnurl_url) as resp:
+                if resp.status != 200:
+                    return False
+                lnurl_data = await resp.json()
+            
+            # 2. 인보이스 요청
+            callback_url = lnurl_data.get("callback")
+            amount_msat = amount * 1000
+            
+            async with session.get(f"{callback_url}?amount={amount_msat}") as resp:
+                if resp.status != 200:
+                    return False
+                invoice_data = await resp.json()
+            
+            # 3. 인보이스 결제
+            payment_request = invoice_data.get("pr")
+            if payment_request:
+                return await pay_invoice(payment_request)
+    
+    except Exception as e:
+        print(f"[ERROR] Pay address failed: {e}")
+    
+    return False

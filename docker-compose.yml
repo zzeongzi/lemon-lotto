@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  bot:
+    build: .
+    container_name: lotto-bot
+    restart: always
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - umbrel_main_network
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    env_file:
+      - .env
+    volumes:
+      - ./lotto.db:/app/lotto.db
+      - ./cogs:/app/cogs
+      - ./database.py:/app/database.py
+      - ./bot.py:/app/bot.py
+
+networks:
+  umbrel_main_network:
+    external: true

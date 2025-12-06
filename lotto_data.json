@@ -1,0 +1,75 @@
+{
+    "jackpot": 10,
+    "balances": {
+        "759983364111073332": 470
+    },
+    "tickets": [
+        {
+            "user_id": 759983364111073332,
+            "user_name": "bitpepper",
+            "numbers": [
+                6,
+                17,
+                23,
+                29,
+                33,
+                41
+            ],
+            "amount": 1,
+            "date": "2025-11-28 15:05:55"
+        },
+        {
+            "user_id": 759983364111073332,
+            "user_name": "bitpepper",
+            "numbers": [
+                1,
+                9,
+                10,
+                28,
+                39,
+                40
+            ],
+            "amount": 1,
+            "date": "2025-11-28 15:14:16"
+        },
+        {
+            "user_id": 759983364111073332,
+            "user_name": "bitpepper",
+            "numbers": [
+                14,
+                20,
+                22,
+                29,
+                37,
+                45
+            ],
+            "amount": 1,
+            "target_block": 925530,
+            "date": "2025-11-28 15:24:51"
+        },
+        {
+            "user_id": 759983364111073332,
+            "user_name": "bitpepper",
+            "numbers": [
+                7,
+                8,
+                9,
+                11,
+                14
+            ],
+            "amount": 10,
+            "target_block": 925550,
+            "date": "2025-11-28 18:47:51"
+        },
+        {
+            "user_id": 759983364111073332,
+            "user_name": "bitpepper",
+            "numbers": [
+                3
+            ],
+            "amount": 10,
+            "target_block": 925550,
+            "date": "2025-11-28 19:07:08"
+        }
+    ]
+}
