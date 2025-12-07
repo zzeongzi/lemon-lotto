@@ -367,6 +367,27 @@ class Database:
         conn.commit()
         conn.close()
 
+    # 🔹 [신규] 만료 임박 당첨금 조회 (3일 전)
+    def get_expiring_wins(self, days_before=3):
+        """만료 임박 당첨금 조회 (3일 전)"""
+        import time
+        now = int(time.time())
+        threshold = now + (days_before * 86400)
+        
+        conn = self.get_connection()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute(
+            """SELECT user_id, amount, expires_at, block_height
+               FROM user_wins
+               WHERE is_claimed = 0 AND is_expired = 0
+               AND expires_at <= ? AND expires_at > ?""",
+            (threshold, now)
+        )
+        rows = c.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
     # --- 채널 관리 ---
     def add_channel(self, channel_id, ch_type, guild_id):
         conn = self.get_connection()
@@ -523,3 +544,13 @@ class Database:
         row = c.fetchone()
         conn.close()
         return dict(row) if row else None
+
+    def execute(self, query, params=()):
+        """범용 쿼리 실행 메서드"""
+        conn = self.get_connection()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute(query, params)
+        rows = c.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]

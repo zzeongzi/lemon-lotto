@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -8,11 +10,22 @@ import aiohttp
 import os
 import time
 import asyncio
-from typing import Union
+from typing import Union, Optional
 from datetime import datetime, timedelta
 
-from . import lnbits 
-from .lnbits import decode_invoice, pay_invoice, get_wallet_balance
+from . import lnbits
+from .lnbits import (
+    decode_invoice,
+    pay_invoice,
+    get_wallet_balance,
+    check_payment,
+    create_invoice,
+    pay_address,
+    create_donate_invoice,
+    check_donate_payment,
+    get_donate_wallet_balance
+)
+
 import sys
 sys.path.append("..") 
 from database import Database
@@ -89,7 +102,7 @@ def get_target_block_for_height(current_height: int) -> int:
     """
     return ((current_height // 10) + 1) * 10
 
-def get_next_round_block(block_height: int) -> int:
+def get_next_round_block(block_height) -> int:
     """다음 회차 블록 계산"""
     return block_height + 10
 
@@ -101,7 +114,7 @@ class DeleteConfirmView(discord.ui.View):
         self.user_id = user_id
 
     @discord.ui.button(label="네, 삭제합니다", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def confirm(self, interaction, button):
         if interaction.user.id != self.user_id:
             return
         db.delete_user_tickets_by_block(self.user_id, self.block_to_delete)
@@ -114,7 +127,7 @@ class DeleteConfirmView(discord.ui.View):
         )
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def cancel(self, interaction, button):
         if interaction.user.id != self.user_id:
             return
         for child in self.children:
@@ -134,7 +147,7 @@ class DeleteHistorySelect(discord.ui.Select):
             options=options
         )
 
-    async def callback(self, interaction: discord.Interaction):
+    async def callback(self, interaction):
         block_to_delete = int(self.values[0])
         view = DeleteConfirmView(block_to_delete, interaction.user.id)
         await interaction.response.send_message(
@@ -159,16 +172,91 @@ class HistoryView(discord.ui.View):
             self.add_item(DeleteHistorySelect(options))
 
 class DonateView(discord.ui.View):
-    def __init__(self, payment_hash, payment_request, amount, user):
+    def __init__(self, payment_hash, payment_request, amount, user, bot):
         super().__init__(timeout=600)
         self.payment_hash = payment_hash
         self.payment_request = payment_request
         self.amount = amount
         self.user = user
         self.is_processed = False
+        self.bot = bot
+        self.message = None
+        self.check_task = None
+    
+    async def start_checking(self):
+        """자동 결제 확인 시작"""
+        self.check_task = asyncio.create_task(self._auto_check_payment())
+    
+    async def _auto_check_payment(self):
+        """2초마다 결제 확인 (최대 120초)"""
+        print(f"[DEBUG] Auto-check started for donation: {self.payment_hash[:16]}...")
+        
+        for i in range(60):  # 120초 동안 2초마다 확인
+            if self.is_processed:
+                print(f"[DEBUG] Payment already processed, stopping auto-check")
+                return
+            
+            await asyncio.sleep(2)
+            
+            try:
+                is_paid = await lnbits.check_donate_payment(self.payment_hash)
+                
+                if is_paid:
+                    print(f"[DEBUG] Auto-check: Payment confirmed!")
+                    await self._process_donation()
+                    return
+            except Exception as e:
+                print(f"[ERROR] Auto-check error: {e}")
+        
+        print(f"[DEBUG] Auto-check timeout (120s)")
+    
+    async def _process_donation(self):
+        """기부 처리"""
+        if self.is_processed:
+            return
+        
+        self.is_processed = True
+        print(f"[DEBUG] Processing donation: {self.amount} sats from user {self.user.id}")
+        
+        try:
+            db.add_donation(self.user.id, self.amount)
+            db.update_user_stats(self.user.id, spent=self.amount)
+            print(f"[DEBUG] Donation recorded in database")
+        except Exception as e:
+            print(f"[ERROR] Database error: {e}")
+            return
+        
+        # 버튼 비활성화
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        
+        # 메시지 업데이트
+        try:
+            if self.message:
+                await self.message.edit(view=self)
+                print(f"[DEBUG] Message buttons disabled")
+        except Exception as e:
+            print(f"[WARN] Could not edit message: {e}")
+        
+        # 공개 메시지 전송
+        try:
+            if self.message:
+                await self.message.channel.send(
+                    f"🍋 **{self.user.mention}**님이 **{self.amount:,} Sats**를 "
+                    "**LEMON DONATE**에 기부하셨습니다!"
+                )
+                print(f"[DEBUG] Donation announcement sent")
+        except Exception as e:
+            print(f"[ERROR] Could not send announcement: {e}")
+    
+    async def on_timeout(self):
+        """타임아웃 시 자동 확인 중지"""
+        if self.check_task and not self.check_task.done():
+            self.check_task.cancel()
 
     @discord.ui.button(label="인보이스 보기", style=discord.ButtonStyle.secondary, emoji="📋")
-    async def copy_address(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def copy_address(self, interaction, button):
         msg = (
             "👇 아래 코드를 복사해서 라이트닝지갑에 붙여넣으세요:\n"
             f"```\n{self.payment_request}\n```"
@@ -176,7 +264,9 @@ class DonateView(discord.ui.View):
         await interaction.response.send_message(msg, ephemeral=True)
 
     @discord.ui.button(label="기부 확인", style=discord.ButtonStyle.primary, emoji="🙏")
-    async def check_donation(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def check_donation(self, interaction, button):
+        print(f"[DEBUG] Donation check button clicked by {interaction.user.id}")
+        
         if interaction.user.id != self.user.id:
             await interaction.response.send_message("본인만 확인할 수 있습니다.", ephemeral=True)
             return
@@ -186,28 +276,63 @@ class DonateView(discord.ui.View):
             return
 
         await interaction.response.defer(ephemeral=True)
-        is_paid = await lnbits.check_payment(self.payment_hash)
+        
+        try:
+            print(f"[DEBUG] Checking payment for hash: {self.payment_hash[:16]}...")
+            is_paid = await lnbits.check_donate_payment(self.payment_hash)
+            print(f"[DEBUG] Payment result: {is_paid}")
+        except Exception as e:
+            print(f"[ERROR] Payment check exception: {e}")
+            await interaction.followup.send(
+                "❌ 결제 확인 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+                ephemeral=True
+            )
+            return
 
         if is_paid:
+            print(f"[DEBUG] Processing donation: {self.amount} sats from user {self.user.id}")
             self.is_processed = True
-            db.add_donation(self.user.id, self.amount)
-            db.update_user_stats(self.user.id, spent=self.amount)
+            
+            try:
+                db.add_donation(self.user.id, self.amount)
+                db.update_user_stats(self.user.id, spent=self.amount)
+                print(f"[DEBUG] Donation recorded in database")
+            except Exception as e:
+                print(f"[ERROR] Database error: {e}")
+                await interaction.followup.send(
+                    "❌ 데이터베이스 오류가 발생했습니다.",
+                    ephemeral=True
+                )
+                return
 
             for child in self.children:
                 if isinstance(child, (discord.ui.Button, discord.ui.Select)):
                     child.disabled = True
 
-            if interaction.message:
-                await interaction.message.edit(view=self)
+            try:
+                if interaction.message:
+                    await interaction.message.edit(view=self)
+            except Exception as e:
+                print(f"[WARN] Could not edit message: {e}")
 
-            await interaction.followup.send(
-                content=(
-                    f"🍋 **{self.user.mention}**님이 **{self.amount:,} Sats**를 "
-                    "**LEMON DONATE**에 기부하셨습니다!"
+            try:
+                await interaction.followup.send(
+                    content=(
+                        f"🍋 **{self.user.mention}**님이 **{self.amount:,} Sats**를 "
+                        "**LEMON DONATE**에 기부하셨습니다!"
+                    ),
+                    ephemeral=False
                 )
-            )
+                print(f"[DEBUG] Donation announcement sent")
+            except Exception as e:
+                print(f"[ERROR] Could not send announcement: {e}")
         else:
-            await interaction.followup.send("❌ 아직 입금이 확인되지 않았습니다.")
+            print(f"[DEBUG] Payment not confirmed yet for hash: {self.payment_hash[:16]}...")
+            await interaction.followup.send(
+                "❌ 아직 입금이 확인되지 않았습니다.\n"
+                "라이트닝 네트워크 처리 시간이 걸릴 수 있습니다. 잠시 후 다시 시도해주세요.",
+                ephemeral=True
+            )
 
 class BuyView(discord.ui.View):
     def __init__(self, payment_request):
@@ -216,7 +341,7 @@ class BuyView(discord.ui.View):
         self.is_processed = False 
 
     @discord.ui.button(label="인보이스 복사", style=discord.ButtonStyle.secondary, emoji="📋")
-    async def copy_address(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def copy_address(self, interaction, button):
         msg = (
             "👇 아래 코드를 복사해서 라이트닝지갑에 붙여넣으세요:\n"
             f"```\n{self.payment_request}\n```"
@@ -232,7 +357,7 @@ class EmergencyWithdrawVoteView(discord.ui.View):
         self.message = None
         self.voted_users = set()
 
-    async def update_embed(self, interaction: discord.Interaction, extra_status: str | None = None):
+    async def update_embed(self, interaction, extra_status=None):
         """투표 결과를 실시간으로 업데이트"""
         row = db.get_dao_votes_summary(self.proposal_id)
         if not row:
@@ -281,7 +406,7 @@ class EmergencyWithdrawVoteView(discord.ui.View):
         
         await interaction.response.edit_message(embed=embed, view=self)
 
-    async def try_finalize_if_needed(self, interaction: discord.Interaction):
+    async def try_finalize_if_needed(self, interaction):
         """가결 조건 충족 시 출금 실행 및 상태 업데이트"""
         row = db.get_dao_votes_summary(self.proposal_id)
         if not row:
@@ -298,7 +423,7 @@ class EmergencyWithdrawVoteView(discord.ui.View):
             for child in self.children:
                 if isinstance(child, discord.ui.Button):
                     child.disabled = True
-            if interaction.message:  # ← 수정됨
+            if interaction.message:
                 await interaction.message.edit(view=self)
             return
 
@@ -315,7 +440,7 @@ class EmergencyWithdrawVoteView(discord.ui.View):
         for child in self.children:
             if isinstance(child, discord.ui.Button):
                 child.disabled = True
-        if interaction.message:  # ← 수정됨
+        if interaction.message:
             await interaction.message.edit(view=self)
 
         reason = row.get("reason", "")
@@ -341,7 +466,7 @@ class EmergencyWithdrawVoteView(discord.ui.View):
             await self.update_embed(interaction, extra_status="출금 실패")
 
     @discord.ui.button(label="✅ 찬성", style=discord.ButtonStyle.green, custom_id="vote_yes")
-    async def vote_yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def vote_yes(self, interaction, button):
         user_id = interaction.user.id
 
         proposal = db.get_dao_proposal(self.proposal_id)
@@ -364,7 +489,7 @@ class EmergencyWithdrawVoteView(discord.ui.View):
         await self.try_finalize_if_needed(interaction)
 
     @discord.ui.button(label="❌ 반대", style=discord.ButtonStyle.red, custom_id="vote_no")
-    async def vote_no(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def vote_no(self, interaction, button):
         user_id = interaction.user.id
 
         proposal = db.get_dao_proposal(self.proposal_id)
@@ -395,11 +520,13 @@ class Lotto(commands.Cog):
         self.check_block_loop.start()
         self.status_update_loop.start()
         self.expire_wins_loop.start()
+        self.expiry_reminder_loop.start()
 
     async def cog_unload(self):
         self.check_block_loop.cancel()
         self.status_update_loop.cancel()
         self.expire_wins_loop.cancel()
+        self.expiry_reminder_loop.cancel()
 
     async def get_real_jackpot(self):
         """LNbits 지갑 - 유저 미출금 합계 (참고용)"""
@@ -441,11 +568,9 @@ class Lotto(commands.Cog):
 
         total_cost = TICKET_PRICE * amount
 
-        # 🔹 해당 회차 prize_pool에 티켓 금액 누적
         db.add_to_round_pool(target_block, total_cost)
         db.update_user_stats(user.id, spent=total_cost)
 
-        # 이번 회차 상금 풀 조회
         round_pool = db.get_round_pool(target_block)
 
         embed = discord.Embed(title="🎉 구매 완료!", color=0x00ff00)
@@ -480,7 +605,6 @@ class Lotto(commands.Cog):
 
         if current_height > self.last_checked_block:
             for h in range(self.last_checked_block + 1, current_height + 1):
-                # 🔹 끝자리가 0인 블록(10의 배수)에서만 추첨
                 if h % 10 == 0:
                     print(f"[Lotto] 회차 블록 도달! #{h} 추첨 시작...")
                     await self.announce_winner(h)
@@ -488,9 +612,7 @@ class Lotto(commands.Cog):
 
     async def announce_winner(self, block_height):
         channels_data = db.get_channels('text')
-        if not channels_data:
-            return
-
+        
         block_hash = await get_block_hash(block_height)
         if not block_hash:
             return
@@ -506,7 +628,6 @@ class Lotto(commands.Cog):
             if ticket_nums == winning_numbers:
                 winners.append(t['user_id'])
 
-        # 🔹 이 회차 상금 풀
         prize_pool = db.get_round_pool(block_height)
         print(f"[DEBUG] announce_winner: block_height={block_height}, prize_pool={prize_pool}, winners={winners}")
 
@@ -518,13 +639,53 @@ class Lotto(commands.Cog):
             net_prize = prize_pool - fee
 
             if winners:
-                per_winner = net_prize  # 단일 당첨 기준
+                per_winner = net_prize
                 mentions = []
+                
                 for uid in winners:
-                    # user_wins에 기록 (30일 만료)
                     db.add_user_win(uid, block_height, per_winner, expires_after_days=30)
                     db.update_user_stats(uid, won=per_winner)
                     mentions.append(f"<@{uid}>")
+                    
+                    dm_sent = False
+                    try:
+                        user = await self.bot.fetch_user(uid)
+                        if user:
+                            dm_embed = discord.Embed(
+                                title="🎉🎉🎉 축하합니다! 당첨되셨습니다! 🎉🎉🎉",
+                                description=(
+                                    f"**#{block_height} 회차**에서 **1등**에 당첨되셨습니다!\n\n"
+                                    f"💰 **당첨금: {per_winner:,} Sats**\n"
+                                    f"🎱 **당첨 번호: {winning_numbers}**\n\n"
+                                    f"⚠️ **중요: 30일 내 수령 필수!**\n"
+                                    f"1️⃣ `/claim` - 당첨금을 잔액으로 이동\n"
+                                    f"2️⃣ `/withdraw_addr [주소]` - 출금\n\n"
+                                    f"🔗 **검증:** `/verify {block_height}`"
+                                ),
+                                color=0xFFD700
+                            )
+                            dm_embed.set_thumbnail(url="https://em-content.zobj.net/thumbs/120/twitter/351/party-popper_1f389.png")
+                            dm_embed.set_footer(text=f"Block Hash: {block_hash}")
+                            
+                            await user.send(embed=dm_embed)
+                            dm_sent = True
+                            print(f"✅ DM 발송 성공: {user.name} ({uid})")
+                    except discord.Forbidden:
+                        print(f"❌ DM 차단됨: {uid}")
+                    except Exception as e:
+                        print(f"❌ DM 발송 실패 ({uid}): {e}")
+                    
+                    if not dm_sent and channels_data:
+                        try:
+                            channel = self.bot.get_channel(channels_data[0]['channel_id'])
+                            if channel:
+                                await channel.send(
+                                    f"🎉 <@{uid}>님 당첨! (DM 차단으로 여기 공지)\n"
+                                    f"💰 **{per_winner:,} Sats** - `/claim`으로 수령하세요!"
+                                )
+                        except:
+                            pass
+                
                 db.set_carryover(block_height, 0)
                 msg = (
                     f"🎉 **당첨자 발생!** {', '.join(mentions)}\n"
@@ -535,7 +696,6 @@ class Lotto(commands.Cog):
                 )
                 color = 0x00FF00
             else:
-                # 당첨자 없음 → net_prize 전액을 다음 회차로 이월
                 next_block = get_next_round_block(block_height)
                 db.add_to_round_pool(next_block, net_prize)
                 db.set_carryover(block_height, net_prize)
@@ -605,11 +765,39 @@ class Lotto(commands.Cog):
             db.add_to_round_pool(next_round_block, total_reclaimed)
             print(f"[EXPIRE] Total {total_reclaimed} sats reclaimed → Round #{next_round_block}")
 
+    @tasks.loop(hours=24)
+    async def expiry_reminder_loop(self):
+        """만료 3일 전 알림"""
+        expiring = db.get_expiring_wins(days_before=3)
+        
+        for row in expiring:
+            try:
+                user = await self.bot.fetch_user(row['user_id'])
+                if user:
+                    days_left = (row['expires_at'] - int(time.time())) // 86400
+                    
+                    embed = discord.Embed(
+                        title="⚠️ 당첨금 만료 임박!",
+                        description=(
+                            f"**#{row['block_height']} 회차** 당첨금이 **{days_left}일 후** 만료됩니다!\n\n"
+                            f"💰 **금액: {row['amount']:,} Sats**\n"
+                            f"📅 **만료일: <t:{row['expires_at']}:F>**\n\n"
+                            f"지금 바로 수령하세요:\n"
+                            f"1️⃣ `/claim` - 잔액으로 이동\n"
+                            f"2️⃣ `/withdraw_addr [주소]` - 즉시 출금"
+                        ),
+                        color=0xFF0000
+                    )
+                    await user.send(embed=embed)
+                    print(f"✅ 만료 알림 발송: {user.name}")
+            except Exception as e:
+                print(f"❌ 만료 알림 실패 ({row['user_id']}): {e}")
+
     channel_group = app_commands.Group(name="channel", description="알림 및 상태 채널 관리")
 
     @channel_group.command(name="add", description="현재 채널(또는 선택한 채널)을 봇 관리 목록에 추가합니다.")
     @commands.has_permissions(administrator=True)
-    async def channel_add(self, interaction: discord.Interaction, channel: Union[discord.TextChannel, discord.VoiceChannel]):
+    async def channel_add(self, interaction: discord.Interaction, channel: discord.TextChannel | discord.VoiceChannel):
         ch_type = 'text' if isinstance(channel, discord.TextChannel) else 'voice'
         db.add_channel(channel.id, ch_type, interaction.guild_id)
         type_str = "📜 공지(텍스트)" if ch_type == 'text' else "🔊 상태표시(음성)"
@@ -619,7 +807,7 @@ class Lotto(commands.Cog):
 
     @channel_group.command(name="remove", description="등록된 채널을 목록에서 제거합니다.")
     @commands.has_permissions(administrator=True)
-    async def channel_remove(self, interaction: discord.Interaction, channel: Union[discord.TextChannel, discord.VoiceChannel]):
+    async def channel_remove(self, interaction: discord.Interaction, channel: discord.TextChannel | discord.VoiceChannel):
         db.remove_channel(channel.id)
         await interaction.response.send_message(
             f"🗑️ **{channel.mention}**이(가) 관리 목록에서 제거되었습니다."
@@ -676,18 +864,27 @@ class Lotto(commands.Cog):
         target_block = get_target_block_for_height(current_height)
         print(f"[DEBUG] /info: current_height={current_height}, target_block={target_block}")
 
+        blocks_remaining = target_block - current_height
+        
         now = int(time.time())
-        elapsed = now - last_timestamp
-        expected_time = 600 
-        remaining = expected_time - elapsed
-
-        if remaining > 0:
-            mins = remaining // 60
-            secs = remaining % 60
-            time_str = f"⏳ 약 **{mins}분 {secs}초** 후"
+        elapsed_since_last = now - last_timestamp
+        
+        current_block_remaining = max(0, 600 - elapsed_since_last)
+        
+        total_remaining = current_block_remaining + ((blocks_remaining - 1) * 600)
+        
+        if total_remaining > 0:
+            hours = total_remaining // 3600
+            mins = (total_remaining % 3600) // 60
+            secs = total_remaining % 60
+            
+            if hours > 0:
+                time_str = f"⏳ 약 **{hours}시간 {mins}분** 후"
+            else:
+                time_str = f"⏳ 약 **{mins}분 {secs}초** 후"
             color = 0x3498db 
         else:
-            time_str = f"🔥 **곧 채굴됩니다!** (평균 시간 초과)"
+            time_str = f"🔥 **곧 채굴됩니다!**"
             color = 0xe74c3c 
 
         prize_pool = db.get_round_pool(target_block)
@@ -704,10 +901,14 @@ class Lotto(commands.Cog):
             value=f"**{prize_pool:,} Sats**",
             inline=False
         )
-        embed.add_field(name="⛏️ 채굴 예상", value=time_str, inline=False)
+        embed.add_field(
+            name="⛏️ 채굴 예상",
+            value=f"{time_str}\n(남은 블록: {blocks_remaining}개)",
+            inline=False
+        )
         embed.add_field(name="🎟️ 판매 현황", value=status_str, inline=True)
         embed.add_field(name="📏 현재 높이", value=f"#{current_height}", inline=True)
-        embed.set_footer(text=f"마지막 블록 생성: {elapsed // 60}분 {elapsed % 60}초 전")
+        embed.set_footer(text=f"마지막 블록 생성: {elapsed_since_last // 60}분 {elapsed_since_last % 60}초 전")
 
         print(f"[DEBUG] Sending embed to user")
         await interaction.followup.send(embed=embed)
@@ -815,18 +1016,27 @@ class Lotto(commands.Cog):
 
     @app_commands.command(name="my", description="내 로또 구매 내역 확인")
     async def my(self, interaction: discord.Interaction):
+        print(f"[DEBUG] /my called by user {interaction.user.id}")
         await interaction.response.defer(ephemeral=True)
+        print(f"[DEBUG] /my deferred")
 
         current_height = await get_current_block_height()
+        print(f"[DEBUG] /my current_height: {current_height}")
         if not current_height:
             await interaction.followup.send("❌ 블록체인 정보를 불러올 수 없습니다.")
             return
 
+        print(f"[DEBUG] /my fetching tickets for user {interaction.user.id}")
         tickets = db.get_user_tickets(interaction.user.id)
+        print(f"[DEBUG] /my tickets count: {len(tickets) if tickets else 0}")
         if not tickets:
+            print(f"[DEBUG] /my no tickets found")
             await interaction.followup.send("🎟️ 구매한 로또 내역이 없습니다.")
             return
+        
+        print(f"[DEBUG] /my processing {len(tickets)} tickets")
 
+        print(f"[DEBUG] /my building history")
         history = {}
         for t in tickets:
             block = t['target_block']
@@ -835,33 +1045,75 @@ class Lotto(commands.Cog):
             nums = eval(t['numbers'])
             history[block].append(nums[0])
 
+        print(f"[DEBUG] /my creating embed with {len(history)} rounds")
         embed = discord.Embed(title="📜 내 로또 구매 내역", color=0x3498db)
 
         for block, nums_list in history.items():
+            print(f"[DEBUG] /my processing block {block}")
             if block > current_height:
+                print(f"[DEBUG] /my block {block} is future")
                 header = f"🟢 #{block} 회차 (추첨 대기)"
                 nums_str = ", ".join(map(str, nums_list))
                 value = f"```\n{nums_str}\n```"
             else:
+                print(f"[DEBUG] /my block {block} is past, getting round_info")
                 round_info = db.get_round_result(block)
-                if not round_info:
+                print(f"[DEBUG] /my round_info: {round_info}")
+                
+                # round_info가 없거나 winning_numbers가 None이면 다시 가져오기
+                if not round_info or round_info.get('winning_numbers') is None:
+                    print(f"[DEBUG] /my no round_info, fetching block hash for {block}")
                     b_hash = await get_block_hash(block)
+                    print(f"[DEBUG] /my block_hash: {b_hash[:20] if b_hash else None}...")
                     if b_hash:
+                        print(f"[DEBUG] /my generating winning numbers for {block}")
                         seed = int(b_hash, 16)
                         w_nums = generate_lotto_numbers(seed)
+                        print(f"[DEBUG] /my winning_numbers: {w_nums}")
                         db.save_round_result(block, w_nums, b_hash)
                         round_info = {'winning_numbers': str(w_nums)}
+                    else:
+                        print(f"[DEBUG] /my failed to get block hash for {block}")
 
-                if round_info:
-                    win_nums = eval(round_info['winning_numbers'])
-                    win_num = win_nums[0]
-                    matched = [n for n in nums_list if n == win_num]
-                    is_winner = len(matched) > 0
-                    result_text = "🎉 당첨!" if is_winner else "💩 꽝"
+                if round_info and round_info.get('winning_numbers') is not None:
+                    print(f"[DEBUG] /my checking winners for block {block}")
+                    try:
+                        # winning_numbers 파싱
+                        win_nums_str = round_info['winning_numbers']
+                        print(f"[DEBUG] /my win_nums_str: {win_nums_str}, type: {type(win_nums_str)}")
+                        
+                        # 문자열이면 eval, 리스트면 그대로 사용
+                        if isinstance(win_nums_str, str):
+                            win_nums = eval(win_nums_str)
+                        else:
+                            win_nums = win_nums_str
+                        
+                        print(f"[DEBUG] /my win_nums: {win_nums}, type: {type(win_nums)}")
+                        
+                        # 리스트에서 첫 번째 숫자 추출
+                        if isinstance(win_nums, list) and len(win_nums) > 0:
+                            win_num = win_nums[0]
+                        else:
+                            raise ValueError(f"Invalid winning_numbers format: {win_nums}")
+                        
+                        print(f"[DEBUG] /my win_num: {win_num}, nums_list: {nums_list}")
+                        matched = [n for n in nums_list if n == win_num]
+                        print(f"[DEBUG] /my matched: {matched}")
+                        is_winner = len(matched) > 0
+                        result_text = "🎉 당첨!" if is_winner else "💩 꽝"
+                        print(f"[DEBUG] /my result: {result_text}")
+                    except Exception as e:
+                        print(f"[ERROR] /my winner check error: {e}")
+                        print(f"[ERROR] /my round_info: {round_info}")
+                        result_text = "⚠️ 오류"
+                        win_num = "?"
+                        is_winner = False
 
+                    print(f"[DEBUG] /my creating header for block {block}")
                     header = (
                         f"🏁 #{block} 회차 - 당첨번호: {win_num} │ {result_text}"
                     )
+                    print(f"[DEBUG] /my header created")
 
                     my_nums_display = []
                     for n in nums_list:
@@ -876,11 +1128,16 @@ class Lotto(commands.Cog):
                     header = f"⚠️ #{block} 회차 (결과 오류)"
                     value = f"```\n{', '.join(map(str, nums_list))}\n```"
 
+            print(f"[DEBUG] /my adding field to embed")
             embed.add_field(name=header, value=value, inline=False)
+            print(f"[DEBUG] /my field added")
 
         embed.set_footer(text=f"현재 블록 높이: #{current_height}")
+        print(f"[DEBUG] /my creating view")
         view = HistoryView(list(history.keys()))
+        print(f"[DEBUG] /my sending response")
         await interaction.followup.send(embed=embed, view=view)
+        print(f"[DEBUG] /my completed")
 
     @app_commands.command(name="claim", description="만료 전 내 당첨금을 지갑 잔액으로 수령합니다.")
     async def claim(self, interaction: discord.Interaction):
@@ -913,7 +1170,6 @@ class Lotto(commands.Cog):
     async def withdraw(self, interaction: discord.Interaction, invoice: str):
         await interaction.response.defer(ephemeral=True)
 
-        # 🔹 1단계: 미수령 당첨금 자동 claim
         pending = db.get_pending_wins(interaction.user.id)
         if pending:
             total_claimed = 0
@@ -927,7 +1183,6 @@ class Lotto(commands.Cog):
                     ephemeral=True
                 )
 
-        # 🔹 2단계: 출금 처리
         user_data = db.get_user(interaction.user.id)
         if not user_data or user_data['balance'] <= 0:
             await interaction.followup.send(
@@ -984,7 +1239,6 @@ class Lotto(commands.Cog):
     async def withdraw_addr(self, interaction: discord.Interaction, address: str):
         await interaction.response.defer(ephemeral=True)
 
-        # 🔹 1단계: 미수령 당첨금 자동 claim
         pending = db.get_pending_wins(interaction.user.id)
         if pending:
             total_claimed = 0
@@ -998,7 +1252,6 @@ class Lotto(commands.Cog):
                     ephemeral=True
                 )
 
-        # 🔹 2단계: 출금 처리
         user_data = db.get_user(interaction.user.id)
         if not user_data or user_data['balance'] <= 0:
             await interaction.followup.send(
@@ -1038,7 +1291,8 @@ class Lotto(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        invoice = await lnbits.create_invoice(
+        # 도네이트 전용 지갑으로 인보이스 생성
+        invoice = await lnbits.create_donate_invoice(
             amount,
             f"Donation - {interaction.user.name}"
         )
@@ -1056,13 +1310,18 @@ class Lotto(commands.Cog):
             invoice['payment_hash'],
             invoice['payment_request'],
             amount,
-            interaction.user
+            interaction.user,
+            self.bot
         )
-        await interaction.followup.send(
-            f"🙏 **{amount:,} Sats** 기부 (LEMON DONATE)",
+        msg = await interaction.followup.send(
+            f"🙏 **{amount:,} Sats** 기부 (LEMON DONATE)"
+
+            f"💡 입금 시 자동으로 확인됩니다.",
             file=file,
             view=view
         )
+        view.message = msg
+        await view.start_checking()
 
     @app_commands.command(name="donate_info", description="🍋 LEMON DONATE 기부 현황 및 랭킹 확인")
     async def donate_info(self, interaction: discord.Interaction):
@@ -1099,7 +1358,6 @@ class Lotto(commands.Cog):
         balance = user['balance']
         roi = ((won - spent) / spent * 100) if spent > 0 else 0
 
-        # 미수령 당첨금 확인
         pending_wins = db.get_pending_wins(interaction.user.id)
         pending_amount = sum(w['amount'] for w in pending_wins)
 
@@ -1188,7 +1446,7 @@ class Lotto(commands.Cog):
         embed.add_field(name="👑 당첨 번호", value=f"**{nums}**", inline=False)
         embed.add_field(name="🔗 블록 해시", value=f"`{block_hash}`", inline=False)
         embed.set_footer(text=pool_str)
-
+        
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(
