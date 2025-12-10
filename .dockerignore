@@ -1,0 +1,17 @@
+﻿__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env.local
+*.db-journal
+*.log
+.git
+.gitignore
+README.md
+*.backup
+*.bak
+.vscode
+.idea

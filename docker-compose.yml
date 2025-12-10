@@ -1,25 +1,27 @@
-version: "3.8"
+﻿version: '3.8'
 
 services:
-  bot:
+  lemon-lotto:
     build: .
-    container_name: lotto-bot
-    restart: always
+    container_name: lemon-lotto-bot
+    restart: unless-stopped
     environment:
-      - PYTHONUNBUFFERED=1
-    networks:
-      - umbrel_main_network
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
-    env_file:
-      - .env
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - BLINK_API_KEY=${BLINK_API_KEY}
+      - BLINK_WALLET_ID=${BLINK_WALLET_ID}
+      - BLINK_DONATE_WALLET_ID=${BLINK_DONATE_WALLET_ID}
+      - MEMPOOL_URL=https://mempool.space
     volumes:
+      - ./data:/app/data
       - ./lotto.db:/app/lotto.db
-      - ./cogs:/app/cogs
-      - ./database.py:/app/database.py
-      - ./bot.py:/app/bot.py
+    networks:
+      - lemon-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
-  umbrel_main_network:
-    external: true
+  lemon-network:
+    driver: bridge
