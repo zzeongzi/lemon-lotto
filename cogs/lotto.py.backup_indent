@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -281,7 +282,7 @@ class EmergencyWithdrawVoteView(discord.ui.View):
         self.message = None
         self.voted_users = set()
 
-    async def update_embed(self, interaction: discord.Interaction, extra_status: Optional[str] = None):
+    async def update_embed(self, interaction, extra_status=None):
         """투표 결과를 실시간으로 업데이트"""
         row = db.get_dao_votes_summary(self.proposal_id)
         if not row:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -198,7 +199,6 @@ class DonateView(discord.ui.View):
 
         await interaction.response.defer(ephemeral=True)
         
-        # 🔹 [수정] lnbits 모듈 명시적 import
         try:
             print(f"[DEBUG] Checking payment for hash: {self.payment_hash[:16]}...")
             is_paid = await lnbits.check_payment(self.payment_hash)
@@ -227,7 +227,6 @@ class DonateView(discord.ui.View):
                 )
                 return
 
-            # 버튼 비활성화
             for child in self.children:
                 if isinstance(child, (discord.ui.Button, discord.ui.Select)):
                     child.disabled = True
@@ -238,7 +237,6 @@ class DonateView(discord.ui.View):
             except Exception as e:
                 print(f"[WARN] Could not edit message: {e}")
 
-            # 공개 메시지 전송
             try:
                 await interaction.followup.send(
                     content=(
@@ -281,7 +279,7 @@ class EmergencyWithdrawVoteView(discord.ui.View):
         self.message = None
         self.voted_users = set()
 
-    async def update_embed(self, interaction: discord.Interaction, extra_status: Optional[str] = None):
+    async def update_embed(self, interaction, extra_status=None):
         """투표 결과를 실시간으로 업데이트"""
         row = db.get_dao_votes_summary(self.proposal_id)
         if not row:
@@ -435,7 +433,6 @@ class EmergencyWithdrawVoteView(discord.ui.View):
         await self.update_embed(interaction)
 
 
-
 # --- Main Cog ---
 class Lotto(commands.Cog):
     def __init__(self, bot):
@@ -445,13 +442,13 @@ class Lotto(commands.Cog):
         self.check_block_loop.start()
         self.status_update_loop.start()
         self.expire_wins_loop.start()
-        self.expiry_reminder_loop.start()  # 🔹 신규: 만료 3일 전 알림
+        self.expiry_reminder_loop.start()
 
     async def cog_unload(self):
         self.check_block_loop.cancel()
         self.status_update_loop.cancel()
         self.expire_wins_loop.cancel()
-        self.expiry_reminder_loop.cancel()  # 🔹 신규
+        self.expiry_reminder_loop.cancel()
 
     async def get_real_jackpot(self):
         """LNbits 지갑 - 유저 미출금 합계 (참고용)"""
@@ -567,13 +564,11 @@ class Lotto(commands.Cog):
                 per_winner = net_prize
                 mentions = []
                 
-                # 🔹 [신규] 당첨자에게 개인 DM 발송
                 for uid in winners:
                     db.add_user_win(uid, block_height, per_winner, expires_after_days=30)
                     db.update_user_stats(uid, won=per_winner)
                     mentions.append(f"<@{uid}>")
                     
-                    # 🎉 당첨자 개인 알림
                     dm_sent = False
                     try:
                         user = await self.bot.fetch_user(uid)
@@ -602,7 +597,6 @@ class Lotto(commands.Cog):
                     except Exception as e:
                         print(f"❌ DM 발송 실패 ({uid}): {e}")
                     
-                    # 🔹 DM 실패 시 채널에 대체 알림
                     if not dm_sent and channels_data:
                         try:
                             channel = self.bot.get_channel(channels_data[0]['channel_id'])
@@ -635,7 +629,6 @@ class Lotto(commands.Cog):
                 )
                 color = 0xFFD700
 
-        # 채널 공지 (기존)
         embed = discord.Embed(title=f"🚨 #{block_height} 회차 결과", color=color)
         embed.add_field(name="👑 당첨 번호", value=f"**{winning_numbers}**", inline=False)
         embed.add_field(name="결과", value=msg, inline=False)
@@ -696,7 +689,7 @@ class Lotto(commands.Cog):
 
     @tasks.loop(hours=24)
     async def expiry_reminder_loop(self):
-        """🔹 [신규] 만료 3일 전 알림"""
+        """만료 3일 전 알림"""
         expiring = db.get_expiring_wins(days_before=3)
         
         for row in expiring:
@@ -772,82 +765,75 @@ class Lotto(commands.Cog):
         await self.announce_winner(block_height)
         await interaction.followup.send(f"✅ #{block_height} 회차 수동 공지 완료")
 
-@app_commands.command(name="info", description="현재 진행 중인 회차 정보와 예상 채굴 시간을 확인합니다.")
-async def info(self, interaction: discord.Interaction):
-    print(f"[DEBUG] /info command called by {interaction.user}")
-    await interaction.response.defer(ephemeral=True)
-    
-    latest_block = await get_latest_block_info()
-    
-    if not latest_block:
-        jackpot = await self.get_real_jackpot()
-        await interaction.followup.send(
-            f"⚠️ 블록체인 정보를 가져오지 못했습니다.\n"
-            f"💰 현재 잭팟(지갑 기준): **{jackpot:,} Sats**"
-        )
-        return
-
-    current_height = latest_block['height']
-    last_timestamp = latest_block['timestamp']
-
-    target_block = get_target_block_for_height(current_height)
-    print(f"[DEBUG] /info: current_height={current_height}, target_block={target_block}")
-
-    # 🔹 [수정] 다음 회차까지 남은 블록 수 계산
-    blocks_remaining = target_block - current_height
-    
-    # 🔹 [수정] 평균 블록 생성 시간 10분 기준으로 예상 시간 계산
-    now = int(time.time())
-    elapsed_since_last = now - last_timestamp  # 마지막 블록 이후 경과 시간
-    
-    # 남은 블록들의 예상 시간 (10분 * 남은 블록 수)
-    estimated_time_for_remaining = blocks_remaining * 600
-    
-    # 현재 블록의 남은 시간 (10분 - 경과 시간)
-    current_block_remaining = max(0, 600 - elapsed_since_last)
-    
-    # 총 예상 시간
-    total_remaining = current_block_remaining + ((blocks_remaining - 1) * 600)
-    
-    if total_remaining > 0:
-        hours = total_remaining // 3600
-        mins = (total_remaining % 3600) // 60
-        secs = total_remaining % 60
+    @app_commands.command(name="info", description="현재 진행 중인 회차 정보와 예상 채굴 시간을 확인합니다.")
+    async def info(self, interaction: discord.Interaction):
+        print(f"[DEBUG] /info command called by {interaction.user}")
+        await interaction.response.defer(ephemeral=True)
         
-        if hours > 0:
-            time_str = f"⏳ 약 **{hours}시간 {mins}분** 후"
+        latest_block = await get_latest_block_info()
+        
+        if not latest_block:
+            jackpot = await self.get_real_jackpot()
+            await interaction.followup.send(
+                f"⚠️ 블록체인 정보를 가져오지 못했습니다.\n"
+                f"💰 현재 잭팟(지갑 기준): **{jackpot:,} Sats**"
+            )
+            return
+
+        current_height = latest_block['height']
+        last_timestamp = latest_block['timestamp']
+
+        target_block = get_target_block_for_height(current_height)
+        print(f"[DEBUG] /info: current_height={current_height}, target_block={target_block}")
+
+        blocks_remaining = target_block - current_height
+        
+        now = int(time.time())
+        elapsed_since_last = now - last_timestamp
+        
+        current_block_remaining = max(0, 600 - elapsed_since_last)
+        
+        total_remaining = current_block_remaining + ((blocks_remaining - 1) * 600)
+        
+        if total_remaining > 0:
+            hours = total_remaining // 3600
+            mins = (total_remaining % 3600) // 60
+            secs = total_remaining % 60
+            
+            if hours > 0:
+                time_str = f"⏳ 약 **{hours}시간 {mins}분** 후"
+            else:
+                time_str = f"⏳ 약 **{mins}분 {secs}초** 후"
+            color = 0x3498db 
         else:
-            time_str = f"⏳ 약 **{mins}분 {secs}초** 후"
-        color = 0x3498db 
-    else:
-        time_str = f"🔥 **곧 채굴됩니다!**"
-        color = 0xe74c3c 
+            time_str = f"🔥 **곧 채굴됩니다!**"
+            color = 0xe74c3c 
 
-    prize_pool = db.get_round_pool(target_block)
-    tickets = db.get_tickets_by_block(target_block)
-    tickets_sold = len(tickets)
-    tickets_left = MAX_TICKETS_PER_ROUND - tickets_sold
-    status_str = f"{tickets_sold} / {MAX_TICKETS_PER_ROUND} 장"
-    if tickets_left == 0:
-        status_str += " (🚫 매진)"
+        prize_pool = db.get_round_pool(target_block)
+        tickets = db.get_tickets_by_block(target_block)
+        tickets_sold = len(tickets)
+        tickets_left = MAX_TICKETS_PER_ROUND - tickets_sold
+        status_str = f"{tickets_sold} / {MAX_TICKETS_PER_ROUND} 장"
+        if tickets_left == 0:
+            status_str += " (🚫 매진)"
 
-    embed = discord.Embed(title=f"🎲 #{target_block} 회차 진행 중", color=color)
-    embed.add_field(
-        name="💰 이번 회차 상금풀",
-        value=f"**{prize_pool:,} Sats**",
-        inline=False
-    )
-    embed.add_field(
-        name="⛏️ 채굴 예상",
-        value=f"{time_str}\n(남은 블록: {blocks_remaining}개)",
-        inline=False
-    )
-    embed.add_field(name="🎟️ 판매 현황", value=status_str, inline=True)
-    embed.add_field(name="📏 현재 높이", value=f"#{current_height}", inline=True)
-    embed.set_footer(text=f"마지막 블록 생성: {elapsed_since_last // 60}분 {elapsed_since_last % 60}초 전")
+        embed = discord.Embed(title=f"🎲 #{target_block} 회차 진행 중", color=color)
+        embed.add_field(
+            name="💰 이번 회차 상금풀",
+            value=f"**{prize_pool:,} Sats**",
+            inline=False
+        )
+        embed.add_field(
+            name="⛏️ 채굴 예상",
+            value=f"{time_str}\n(남은 블록: {blocks_remaining}개)",
+            inline=False
+        )
+        embed.add_field(name="🎟️ 판매 현황", value=status_str, inline=True)
+        embed.add_field(name="📏 현재 높이", value=f"#{current_height}", inline=True)
+        embed.set_footer(text=f"마지막 블록 생성: {elapsed_since_last // 60}분 {elapsed_since_last % 60}초 전")
 
-    print(f"[DEBUG] Sending embed to user")
-    await interaction.followup.send(embed=embed)
+        print(f"[DEBUG] Sending embed to user")
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="buy", description="로또 구매 (1장~5장)")
     @app_commands.describe(amount="구매할 수량 (기본 1장, 최대 5장)")
@@ -1320,7 +1306,6 @@ async def info(self, interaction: discord.Interaction):
         embed.add_field(name="👑 당첨 번호", value=f"**{nums}**", inline=False)
         embed.add_field(name="🔗 블록 해시", value=f"`{block_hash}`", inline=False)
         embed.set_footer(text=pool_str)
-
         
         await interaction.followup.send(embed=embed)
 
