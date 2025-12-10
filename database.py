@@ -53,12 +53,25 @@ class Database:
                         guild_id INTEGER
                     )''')
         
-        # 기부 테이블
+        # 🔹 기부 테이블
         c.execute('''CREATE TABLE IF NOT EXISTS donations (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         user_id INTEGER,
                         amount INTEGER,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )''')
+
+        # 🔹 인보이스 테이블 (payment_request 추가)
+        c.execute('''CREATE TABLE IF NOT EXISTS invoices (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        payment_hash TEXT UNIQUE NOT NULL,
+                        payment_request TEXT,
+                        amount INTEGER NOT NULL,
+                        type TEXT NOT NULL,
+                        status TEXT DEFAULT 'PENDING',
+                        user_id INTEGER,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        paid_at TIMESTAMP
                     )''')
 
         # 비상 출금 제안 테이블
@@ -84,7 +97,7 @@ class Database:
                         PRIMARY KEY (proposal_id, user_id)
                     )''')
 
-        # 🔹 유저 회차별 당첨 기록 테이블 (user_wins)
+        # 유저 회차별 당첨 기록 테이블
         c.execute('''CREATE TABLE IF NOT EXISTS user_wins (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         user_id INTEGER NOT NULL,
@@ -96,7 +109,13 @@ class Database:
                         is_expired INTEGER NOT NULL DEFAULT 0
                     )''')
 
-        # 스키마 마이그레이션(기존 DB에 컬럼 없을 수 있음)
+        # 🔹 마이그레이션: payment_request 컬럼 추가
+        try:
+            c.execute("ALTER TABLE invoices ADD COLUMN payment_request TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        # 스키마 마이그레이션
         try:
             c.execute("ALTER TABLE rounds ADD COLUMN prize_pool INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
@@ -115,7 +134,61 @@ class Database:
     def get_connection(self):
         return sqlite3.connect(DB_FILE)
 
-    # --- [신규] 사용자들의 미출금 잔액 총합 구하기 ---
+    # --- 🔹 인보이스 관련 (수정됨) ---
+    
+    def save_invoice(self, payment_hash, amount, invoice_type="lotto", user_id=None, payment_request=None):
+        """인보이스 저장 (type: 'lotto' or 'donate')"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO invoices (payment_hash, payment_request, amount, type, user_id) VALUES (?, ?, ?, ?, ?)",
+            (payment_hash, payment_request, amount, invoice_type, user_id)
+        )
+        conn.commit()
+        conn.close()
+
+    def get_invoice(self, payment_hash):
+        """인보이스 조회"""
+        conn = self.get_connection()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM invoices WHERE payment_hash = ?", (payment_hash,))
+        row = c.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def mark_invoice_paid(self, payment_hash):
+        """인보이스를 PAID 상태로 변경"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute(
+            "UPDATE invoices SET status = 'PAID', paid_at = CURRENT_TIMESTAMP WHERE payment_hash = ?",
+            (payment_hash,)
+        )
+        conn.commit()
+        conn.close()
+
+    def get_balance_by_type(self, invoice_type):
+        """타입별 누적 금액 조회 (PAID 상태만)"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE type = ? AND status = 'PAID'",
+            (invoice_type,)
+        )
+        result = c.fetchone()[0]
+        conn.close()
+        return result if result else 0
+
+    def get_lotto_balance(self):
+        """로또 판매금 총합"""
+        return self.get_balance_by_type("lotto")
+
+    def get_donate_balance(self):
+        """기부금 총합"""
+        return self.get_balance_by_type("donate")
+
+    # --- 사용자들의 미출금 잔액 총합 구하기 ---
     def get_total_user_liabilities(self):
         conn = self.get_connection()
         c = conn.cursor()
@@ -136,7 +209,12 @@ class Database:
         conn.commit()
         conn.close()
 
+    def add_ticket(self, user_id, numbers, target_block):
+        """티켓 추가 (save_ticket의 별칭)"""
+        return self.save_ticket(user_id, numbers, target_block)
+
     def get_tickets_by_block(self, block_height):
+        """특정 블록의 모든 티켓 조회 (get_tickets_for_block의 별칭)"""
         conn = self.get_connection()
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
@@ -144,6 +222,10 @@ class Database:
         rows = c.fetchall()
         conn.close()
         return [dict(row) for row in rows]
+
+    def get_tickets_for_block(self, block_height):
+        """특정 블록의 모든 티켓 조회"""
+        return self.get_tickets_by_block(block_height)
 
     def get_user_tickets(self, user_id):
         conn = self.get_connection()
@@ -260,7 +342,7 @@ class Database:
         return dict(row) if row else None
 
     def add_to_round_pool(self, block_height, amount):
-        """특정 회차의 prize_pool에 금액 추가 (티켓 구매/이월 시 호출)"""
+        """특정 회차의 prize_pool에 금액 추가"""
         conn = self.get_connection()
         c = conn.cursor()
         c.execute(
@@ -274,6 +356,10 @@ class Database:
         conn.commit()
         conn.close()
 
+    def add_to_prize_pool(self, block_height, amount):
+        """상금풀에 금액 추가 (add_to_round_pool의 별칭)"""
+        return self.add_to_round_pool(block_height, amount)
+
     def get_round_pool(self, block_height):
         """해당 회차의 prize_pool 조회"""
         conn = self.get_connection()
@@ -285,6 +371,10 @@ class Database:
         if not row:
             return 0
         return row["prize_pool"] if row["prize_pool"] is not None else 0
+
+    def get_prize_pool(self, block_height):
+        """상금풀 조회 (get_round_pool의 별칭)"""
+        return self.get_round_pool(block_height)
 
     def set_carryover(self, block_height, amount):
         """해당 회차에서 다음 회차로 이월된 금액 기록"""
@@ -299,7 +389,7 @@ class Database:
 
     # --- user_wins 관련 ---
     def add_user_win(self, user_id, block_height, amount, expires_after_days=30):
-        """유저 회차별 당첨 기록 추가 (당첨 시 호출)"""
+        """유저 회차별 당첨 기록 추가"""
         conn = self.get_connection()
         c = conn.cursor()
         now_ts = int(datetime.utcnow().timestamp())
@@ -311,6 +401,7 @@ class Database:
         )
         conn.commit()
         conn.close()
+        print(f"[DB] add_user_win: user_id={user_id}, block={block_height}, amount={amount}")
 
     def get_pending_wins(self, user_id):
         """아직 claim/만료되지 않은 당첨 기록"""
@@ -367,7 +458,6 @@ class Database:
         conn.commit()
         conn.close()
 
-    # 🔹 [신규] 만료 임박 당첨금 조회 (3일 전)
     def get_expiring_wins(self, days_before=3):
         """만료 임박 당첨금 조회 (3일 전)"""
         import time
@@ -424,12 +514,26 @@ class Database:
         conn.close()
 
     def get_total_donations(self):
+        """donations 테이블의 총합 (참고용)"""
         conn = self.get_connection()
         c = conn.cursor()
         c.execute("SELECT SUM(amount) FROM donations")
         res = c.fetchone()[0]
         conn.close()
         return res if res else 0
+
+    def get_user_total_donation(self, user_id):
+        """특정 유저의 총 기부금액 조회"""
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute("""
+            SELECT COALESCE(SUM(amount), 0) as total
+            FROM donations
+            WHERE user_id = ?
+        """, (user_id,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else 0
 
     def get_donation_ranking(self, limit=10):
         conn = self.get_connection()
@@ -446,8 +550,7 @@ class Database:
         conn.close()
         return [dict(row) for row in rows]
 
-    # --- 비상 출금(DAO) 관련 메서드 ---
-
+    # --- DAO 관련 ---
     def create_dao_proposal(
         self,
         proposal_id: str,
